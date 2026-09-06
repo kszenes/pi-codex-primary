@@ -62,7 +62,7 @@ function getAuthStorage(ctx: {
 }): {
 	hasAuth(provider: string): boolean;
 	get(provider: string): Record<string, unknown> | undefined;
-	logout(provider: string): void;
+	logout(provider: string): boolean;
 } {
 	return {
 		hasAuth: (provider) => ctx.modelRegistry.getProviderAuthStatus(provider).configured,
@@ -71,11 +71,12 @@ function getAuthStorage(ctx: {
 			try {
 				const authPath = join(getAgentDir(), "auth.json");
 				const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
-				if (!data[provider]) return;
+				if (!data[provider]) return true;
 				delete data[provider];
 				writeJsonAtomic(authPath, data);
+				return true;
 			} catch {
-				// Missing or unreadable auth storage means there is nothing to log out.
+				return false;
 			}
 		},
 	};
@@ -97,11 +98,12 @@ async function safeSetModel(pi: ExtensionAPI, model: Model<Api>): Promise<boolea
 // Provider templates
 // ==========================================================================
 
-const openaiCodexProvider = builtinProviders().find(({ id }) => id === "openai-codex");
-const openaiCodexOAuth = openaiCodexProvider?.auth.oauth;
-if (!openaiCodexProvider || !openaiCodexOAuth) {
+const codexProvider = builtinProviders().find(({ id }) => id === "openai-codex");
+if (!codexProvider?.auth.oauth) {
 	throw new Error("pi-codex-primary: the installed pi-ai OpenAI Codex provider has no OAuth flow");
 }
+const openaiCodexProvider = codexProvider;
+const openaiCodexOAuth = codexProvider.auth.oauth;
 
 function getCodexModels(): Model<Api>[] {
 	return [...openaiCodexProvider.getModels()] as Model<Api>[];
@@ -2763,8 +2765,9 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (getAuthStorage(ctx).hasAuth(name)) {
-		getAuthStorage(ctx).logout(name);
+	if (getAuthStorage(ctx).hasAuth(name) && !getAuthStorage(ctx).logout(name)) {
+		ctx.ui.notify(`Could not log out of ${subDisplayName(entry)}; subscription was not removed.`, "error");
+		return;
 	}
 	pi.unregisterProvider(name);
 
@@ -2840,7 +2843,10 @@ async function showSubscriptionActions(
 		return;
 	}
 	if (action === "logout") {
-		getAuthStorage(ctx).logout(name);
+		if (!getAuthStorage(ctx).logout(name)) {
+			ctx.ui.notify(`Could not log out of ${subDisplayName(entry)}.`, "error");
+			return;
+		}
 		ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
@@ -3117,7 +3123,10 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	getAuthStorage(ctx).logout(subProviderName(entry));
+	if (!getAuthStorage(ctx).logout(subProviderName(entry))) {
+		ctx.ui.notify(`Could not log out of ${subDisplayName(entry)}.`, "error");
+		return;
+	}
 	ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
@@ -3142,8 +3151,10 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 		if (!hasAuth) {
 			status = "not logged in";
 		} else if (cred?.type === "oauth") {
-			const expiresIn = cred.expires - Date.now();
-			if (expiresIn > 0) {
+			const expiresIn = typeof cred.expires === "number" ? cred.expires - Date.now() : undefined;
+			if (expiresIn === undefined) {
+				status = "logged in";
+			} else if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
 				status = `logged in (expires ${mins}m)`;
 			} else {
@@ -5556,7 +5567,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainMenu(ctx, poolManager);
 						case "list":
 						case "ls":
-							return handlePoolChainList(ctx);
+							return handlePoolChainList(ctx, poolManager);
 						case "toggle":
 							return handlePoolChainToggle(ctx);
 						case "remove":
@@ -5565,7 +5576,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx);
+							return handlePoolChainStatus(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);

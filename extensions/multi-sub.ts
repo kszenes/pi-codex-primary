@@ -7,7 +7,7 @@
  * Features:
  *   - /subs: manage subscriptions (add, remove, login, logout, status)
  *   - /pool: define provider pools with auto-rotation on rate limit errors
- *   - Project-level pool config: .pi/multi-pass.json overrides global pools
+ *   - Project-level pool config: .pi/codex-primary.json overrides global pools
  *   - MULTI_SUB env var for scripting
  *
  * Pool auto-rotation: group subscriptions into pools. When the active sub
@@ -16,8 +16,8 @@
  * provider/account.
  *
  * Config files:
- *   Global:  ~/.pi/agent/multi-pass.json  (subscriptions + default pools)
- *   Project: .pi/multi-pass.json          (pool overrides + subscription filtering)
+ *   Global:  ~/.pi/agent/codex-primary.json  (subscriptions + default pools)
+ *   Project: .pi/codex-primary.json          (pool overrides + subscription filtering)
  *
  * Project-level config can:
  *   - Define project-specific pools (override global pools)
@@ -88,7 +88,7 @@ async function safeSetModel(pi: ExtensionAPI, model: Model<Api>): Promise<boolea
 		return await pi.setModel(model);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
-		console.warn(`multi-pass: model switch to ${model.provider}/${model.id} failed: ${detail}`);
+		console.warn(`codex-primary: model switch to ${model.provider}/${model.id} failed: ${detail}`);
 		return false;
 	}
 }
@@ -100,7 +100,7 @@ async function safeSetModel(pi: ExtensionAPI, model: Model<Api>): Promise<boolea
 const openaiCodexProvider = builtinProviders().find(({ id }) => id === "openai-codex");
 const openaiCodexOAuth = openaiCodexProvider?.auth.oauth;
 if (!openaiCodexProvider || !openaiCodexOAuth) {
-	throw new Error("pi-codex-multi: the installed pi-ai OpenAI Codex provider has no OAuth flow");
+	throw new Error("pi-codex-primary: the installed pi-ai OpenAI Codex provider has no OAuth flow");
 }
 
 function getCodexModels(): Model<Api>[] {
@@ -171,8 +171,11 @@ interface QuotaCheckResult {
 	summary: string;
 	details: string[];
 	score: number;
-	/** Earliest known reset timestamp (epoch seconds) for this account's
-	 *  usage windows, if the provider reported one. */
+	fiveHourLeft?: number;
+	weeklyLeft?: number;
+	fiveHourResetAt?: number;
+	weeklyResetAt?: number;
+	/** When the currently limiting usage window(s) have all reset, in epoch seconds. */
 	resetAt?: number;
 }
 
@@ -263,16 +266,31 @@ function getCodexWindowRemaining(window: CodexUsageWindow | undefined): number |
 	return Math.max(0, Math.min(100, 100 - window.usedPercent));
 }
 
+/** Return the point when every currently limiting window has reset. */
+function getCodexRecoveryResetAt(snapshot: CodexUsageSnapshot): number | undefined {
+	const now = Date.now() / 1000;
+	const windows = [snapshot.fiveHour, snapshot.weekly].filter(
+		(window): window is CodexUsageWindow => Boolean(window?.resetAt && window.resetAt > now),
+	);
+	if (windows.length === 0) return undefined;
+	const highestUsage = Math.max(...windows.map((window) => window.usedPercent));
+	return Math.max(
+		...windows
+			.filter((window) => window.usedPercent === highestUsage)
+			.map((window) => window.resetAt as number),
+	);
+}
+
 function formatResetShort(resetAt?: number): string {
 	if (!resetAt) return "--";
 	const diffMs = resetAt * 1000 - Date.now();
 	if (diffMs <= 0) return "now";
-	const totalMinutes = Math.round(diffMs / 60000);
+	const totalMinutes = Math.max(1, Math.ceil(diffMs / 60000));
 	const days = Math.floor(totalMinutes / (60 * 24));
 	const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
 	const minutes = totalMinutes % 60;
-	if (days > 0) return `~${days}d`;
-	if (hours > 0) return `~${hours}h`;
+	if (days > 0) return `~${days}d${hours > 0 ? `${hours}h` : ""}`;
+	if (hours > 0) return `~${hours}h${minutes > 0 ? `${minutes}m` : ""}`;
 	return `~${minutes}m`;
 }
 
@@ -742,7 +760,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 		const headers = new Headers({
 			Authorization: `Bearer ${auth.access}`,
 			Accept: "application/json",
-			"User-Agent": "pi-codex-multi",
+			"User-Agent": "pi-codex-primary",
 		});
 		if (accountId) {
 			headers.set("chatgpt-account-id", accountId);
@@ -777,11 +795,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-			// Earliest future window reset = when this account can serve again.
-			const futureResets = [snapshot.fiveHour?.resetAt, snapshot.weekly?.resetAt].filter(
-				(reset): reset is number => typeof reset === "number" && reset * 1000 > Date.now(),
-			);
-			const nextResetAt = futureResets.length > 0 ? Math.min(...futureResets) : undefined;
+			const recoveryResetAt = getCodexRecoveryResetAt(snapshot);
 			const classification = classifyCodexQuotaKind(snapshot);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
@@ -809,7 +823,11 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				summary,
 				details,
 				score: classification.score,
-				resetAt: nextResetAt,
+				fiveHourLeft,
+				weeklyLeft,
+				fiveHourResetAt: snapshot.fiveHour?.resetAt,
+				weeklyResetAt: snapshot.weekly?.resetAt,
+				resetAt: recoveryResetAt,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -879,7 +897,7 @@ async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 // ==========================================================================
-// Config persistence (~/.pi/agent/multi-pass.json)
+// Config persistence (~/.pi/agent/codex-primary.json)
 // ==========================================================================
 
 interface SubEntry {
@@ -889,6 +907,7 @@ interface SubEntry {
 }
 
 /** Pool member selection strategy.
+ *  - "priority": always use the first healthy member and fail back to it.
  *  - "round-robin": rotate sequentially through members (default).
  *  - "quota-first": query built-in quota checkers and prefer the member
  *    with the most remaining quota. Falls back to round-robin when no
@@ -897,7 +916,7 @@ interface SubEntry {
  *    member. Preferred members in their active window go first (shortest
  *    remaining window first), then default members, then overflow.
  *  - "custom": delegate selection to a user-provided JS script. */
-type PoolStrategy = "round-robin" | "quota-first" | "scheduled" | "custom";
+type PoolStrategy = "priority" | "round-robin" | "quota-first" | "scheduled" | "custom";
 
 type DayOfWeek = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 const ALL_DAYS: readonly DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -1009,6 +1028,8 @@ interface ChainConfig {
 
 interface MultiPassConfig {
 	subscriptions: SubEntry[];
+	/** Optional short labels used in the footer, including the built-in account. */
+	accountLabels?: Record<string, string>;
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
@@ -1017,7 +1038,7 @@ interface MultiPassConfig {
 	maxRetries?: number;
 }
 
-/** Project-level config (.pi/multi-pass.json) */
+/** Project-level config (.pi/codex-primary.json) */
 interface ProjectConfig {
 	/** Override pools for this project. If set, replaces global pools. */
 	pools?: PoolConfig[];
@@ -1032,6 +1053,7 @@ interface ProjectConfig {
 /** Effective config after merging global + project */
 interface EffectiveConfig {
 	subscriptions: SubEntry[];
+	accountLabels?: Record<string, string>;
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
@@ -1042,11 +1064,11 @@ interface EffectiveConfig {
 }
 
 function globalConfigPath(): string {
-	return join(getAgentDir(), "multi-pass.json");
+	return join(getAgentDir(), "codex-primary.json");
 }
 
 function projectConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "multi-pass.json");
+	return join(cwd, ".pi", "codex-primary.json");
 }
 
 /** Write JSON atomically: temp file in the same directory, then rename over
@@ -1070,7 +1092,7 @@ function writeJsonAtomic(path: string, data: unknown, mode = 0o600): void {
 }
 
 // ==========================================================================
-// Persisted pool exhaustion state (~/.pi/agent/multi-pass.state.json)
+// Persisted pool exhaustion state (~/.pi/agent/codex-primary.state.json)
 // ==========================================================================
 
 interface PersistedPoolState {
@@ -1078,7 +1100,7 @@ interface PersistedPoolState {
 }
 
 function multiPassStatePath(): string {
-	return join(getAgentDir(), "multi-pass.state.json");
+	return join(getAgentDir(), "codex-primary.state.json");
 }
 
 /** Persist exhausted-until timestamps atomically; prunes expired entries. */
@@ -1110,7 +1132,7 @@ function isCodexProviderName(value: unknown): value is string {
 }
 
 function isPoolStrategy(value: unknown): value is PoolStrategy {
-	return value === "round-robin" || value === "quota-first" || value === "scheduled" || value === "custom";
+	return value === "priority" || value === "round-robin" || value === "quota-first" || value === "scheduled" || value === "custom";
 }
 
 function normalizePools(pools: unknown): PoolConfig[] {
@@ -1131,6 +1153,11 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		subscriptions: Array.isArray(parsed.subscriptions)
 			? parsed.subscriptions.filter((entry) => entry && entry.provider === "openai-codex")
 			: [],
+		accountLabels: parsed.accountLabels && typeof parsed.accountLabels === "object"
+			? Object.fromEntries(Object.entries(parsed.accountLabels).filter(
+				([provider, label]) => isCodexProviderName(provider) && typeof label === "string" && label.trim(),
+			))
+			: undefined,
 		pools: normalizePools(parsed.pools),
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
 		presets: Array.isArray(parsed.presets)
@@ -1246,6 +1273,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	if (!project) {
 		const value: EffectiveConfig = {
 			subscriptions: mergedSubscriptions,
+			accountLabels: global.accountLabels,
 			pools: global.pools,
 			chains: global.chains,
 			presets: global.presets,
@@ -1270,6 +1298,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 
 	const value: EffectiveConfig = {
 		subscriptions: subs,
+		accountLabels: global.accountLabels,
 		pools,
 		chains,
 		presets: global.presets,
@@ -1297,6 +1326,103 @@ function getProviderDisplayName(providerName: string, subscriptions: SubEntry[])
 		return subDisplayName(subEntry);
 	}
 	return PROVIDER_TEMPLATES[providerName]?.displayName || providerName;
+}
+
+function getProviderShortLabel(providerName: string, config: MultiPassConfig): string {
+	const configured = config.accountLabels?.[providerName]?.trim();
+	if (configured) return configured;
+	const subEntry = config.subscriptions.find((entry) => subProviderName(entry) === providerName);
+	return subEntry?.label || providerName;
+}
+
+function formatQuotaFooterWindow(
+	ctx: ExtensionContext,
+	label: string,
+	remaining: number | undefined,
+	resetAt: number | undefined,
+): string | undefined {
+	if (remaining === undefined) return undefined;
+	const percentage = ctx.ui.theme.bold(`${Math.round(remaining)}%`);
+	const colored = remaining <= 20
+		? ctx.ui.theme.fg("error", percentage)
+		: remaining <= 50
+			? ctx.ui.theme.fg("warning", percentage)
+			: ctx.ui.theme.fg("success", percentage);
+	return `${label}: ${colored}${resetAt ? ` (${formatResetShort(resetAt)})` : ""}`;
+}
+
+async function updateQuotaFooter(ctx: ExtensionContext, providerName?: string): Promise<void> {
+	if (!providerName || getBaseProvider(providerName) !== "openai-codex") {
+		ctx.ui.setStatus("codex-sub", undefined);
+		return;
+	}
+
+	const config = loadGlobalConfig();
+	const auth = getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined;
+	const label = getProviderShortLabel(providerName, config);
+	const priorityPool = config.pools.find(
+		(pool) => pool.enabled && pool.strategy === "priority" && pool.members.includes(providerName),
+	);
+	const fallbackPrefix = priorityPool && priorityPool.members[0] !== providerName ? "↩ " : "";
+	if (!auth) {
+		ctx.ui.setStatus("codex-sub", `${fallbackPrefix}${label} | not logged in`);
+		return;
+	}
+
+	const [result] = await runQuotaChecks([{
+		providerName,
+		baseProvider: "openai-codex",
+		displayName: label,
+		auth,
+	}]);
+	if (!result || result.kind === "error" || result.kind === "missing-auth") {
+		ctx.ui.setStatus("codex-sub", `${label} | usage unavailable`);
+		return;
+	}
+	const windows = [
+		formatQuotaFooterWindow(ctx, "5h", result.fiveHourLeft, result.fiveHourResetAt),
+		formatQuotaFooterWindow(ctx, "7d", result.weeklyLeft, result.weeklyResetAt),
+	].filter((window): window is string => Boolean(window));
+	ctx.ui.setStatus("codex-sub", [`${fallbackPrefix}${label}`, ...windows].join(" | "));
+}
+
+/** Seed exact cooldown state on startup, avoiding one doomed primary request.
+ *  When the primary is exhausted, switch to the first healthy fallback immediately. */
+async function syncPriorityExhaustion(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	poolManager: PoolManager,
+	pools: PoolConfig[],
+): Promise<void> {
+	for (const pool of pools) {
+		if (!pool.enabled || pool.strategy !== "priority") continue;
+		const primary = pool.members[0];
+		const auth = primary
+			? getAuthStorage(ctx).get(primary) as AuthStorageEntry | undefined
+			: undefined;
+		if (!primary || !auth) continue;
+		const [result] = await runQuotaChecks([{
+			providerName: primary,
+			baseProvider: "openai-codex",
+			displayName: primary,
+			auth,
+		}]);
+		const exhausted = result?.fiveHourLeft === 0 || result?.weeklyLeft === 0;
+		if (exhausted && result?.resetAt && result.resetAt * 1000 > Date.now()) {
+			poolManager.markExhausted(primary, result.resetAt * 1000 - Date.now());
+			if (ctx.model?.provider === primary) {
+				const fallback = poolManager.getPreferredMember(pool, getAuthStorage(ctx));
+				const modelId = ctx.model.id;
+				const nextModel = fallback ? ctx.modelRegistry.find(fallback, modelId) : undefined;
+				if (nextModel && await safeSetModel(pi, nextModel as Model<Api>)) {
+					ctx.ui.notify(
+						`⚠️ Primary account is exhausted (resets ${formatResetLong(result.resetAt)}); using fallback for now.`,
+						"info",
+					);
+				}
+			}
+		}
+	}
 }
 
 function getProjectScopedProviderNames(
@@ -1534,9 +1660,7 @@ function isTransientOverloadError(errorMessage: string): boolean {
 // Retry-aware cooldown math
 // ==========================================================================
 
-const MIN_EXHAUSTED_MS = 60 * 1000; // 1 min floor
-const MAX_EXHAUSTED_MS = 30 * 60 * 1000; // 30 min cap
-const DEFAULT_EXHAUSTED_MS = 5 * 60 * 1000; // 5 min fallback
+const DEFAULT_EXHAUSTED_MS = 5 * 60 * 1000; // used only when Codex reports no reset
 
 /** Pull a Retry-After delay (seconds) out of an error message, if present. */
 function parseRetryAfterSeconds(errorMessage: string): number | undefined {
@@ -1546,10 +1670,10 @@ function parseRetryAfterSeconds(errorMessage: string): number | undefined {
 	return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
 }
 
-/** Clamp an exhaustion TTL: floor 60s, cap 30min, fallback 5min. */
-function clampExhaustedMs(ttlMs: number | undefined): number {
+/** Preserve provider reset times exactly; use 5 minutes only when no reset is known. */
+function normalizeExhaustedMs(ttlMs: number | undefined): number {
 	if (ttlMs === undefined || !Number.isFinite(ttlMs) || ttlMs <= 0) return DEFAULT_EXHAUSTED_MS;
-	return Math.min(Math.max(ttlMs, MIN_EXHAUSTED_MS), MAX_EXHAUSTED_MS);
+	return ttlMs;
 }
 
 // ==========================================================================
@@ -1836,6 +1960,14 @@ class PoolManager {
 		});
 	}
 
+	/** First healthy member wins; pool order is the priority order. */
+	getPreferredMember(
+		pool: PoolConfig,
+		authStorage: { hasAuth(provider: string): boolean },
+	): string | undefined {
+		return this.getAvailableMembers(pool, authStorage)[0];
+	}
+
 	isMemberExhausted(pool: PoolConfig, provider: string): boolean {
 		const state = this.getOrCreatePoolState(pool.name);
 		const exhaustedUntil = state.exhausted.get(provider);
@@ -2008,26 +2140,39 @@ class PoolManager {
 		};
 	}
 
-	/** Mark a member as exhausted (hit a per-account rate limit).
-	 *  cooldownMs may come from a Retry-After header or the account's known
-	 *  quota reset; clamped to [60s, 30min], defaulting to 5min. */
+	/** Mark a member unavailable until its provider-reported reset. */
 	markExhausted(providerName: string, cooldownMs?: number): void {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
-		state.exhausted.set(providerName, Date.now() + clampExhaustedMs(cooldownMs));
+		state.exhausted.set(providerName, Date.now() + normalizeExhaustedMs(cooldownMs));
 		this.persistExhaustedState();
 	}
 
-	/** Derive the exhaustion cooldown for a provider: Retry-After from the
-	 *  error message first, then the account's cached quota reset timestamp,
-	 *  then the default fallback. Values are clamped in clampExhaustedMs. */
-	private resolveExhaustedMs(providerName: string, errorMessage: string): number | undefined {
+	/** Fetch a fresh Codex usage snapshot so long-window resets are exact. */
+	private async resolveExhaustedMs(
+		providerName: string,
+		errorMessage: string,
+		ctx: ExtensionContext,
+	): Promise<number | undefined> {
+		const auth = getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined;
+		if (auth) {
+			const result = await codexQuotaChecker.check({
+				providerName,
+				baseProvider: getBaseProvider(providerName) || providerName,
+				displayName: providerName,
+				auth,
+			});
+			if (result.resetAt && result.resetAt * 1000 > Date.now()) {
+				quotaResultCache.set(providerName, { expires: Date.now() + QUOTA_CACHE_TTL_MS, result });
+				return result.resetAt * 1000 - Date.now();
+			}
+		}
+
 		const retryAfter = parseRetryAfterSeconds(errorMessage);
 		if (retryAfter !== undefined) return retryAfter * 1000;
 		const resetAt = getCachedQuotaResetAt(providerName);
-		if (resetAt !== undefined) return resetAt * 1000 - Date.now();
-		return undefined;
+		return resetAt !== undefined ? resetAt * 1000 - Date.now() : undefined;
 	}
 
 	/** Best-effort persistence of exhaustion timestamps across processes. */
@@ -2158,6 +2303,15 @@ class PoolManager {
 			(c) => c.source === "pool" && c.poolName === pool.name,
 		);
 		if (poolCandidates.length < 2 && strategy !== "custom") return;
+
+		if (strategy === "priority") {
+			plan.candidates.sort((left, right) => {
+				if (left.source !== "pool" || left.poolName !== pool.name) return 1;
+				if (right.source !== "pool" || right.poolName !== pool.name) return -1;
+				return pool.members.indexOf(left.provider) - pool.members.indexOf(right.provider);
+			});
+			return;
+		}
 
 		if (strategy === "quota-first") {
 			try {
@@ -2310,7 +2464,7 @@ class PoolManager {
 		if (!isTransientOverloadError(errorMessage)) {
 			this.markExhausted(
 				currentModel.provider,
-				this.resolveExhaustedMs(currentModel.provider, errorMessage),
+				await this.resolveExhaustedMs(currentModel.provider, errorMessage, ctx),
 			);
 		}
 
@@ -2394,7 +2548,7 @@ class PoolManager {
 				formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
 				"info",
 			);
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+			ctx.ui.setStatus("codex-primary", formatFailoverStatus(nextCandidate));
 
 			if (lastUserPrompt) {
 				this.suppressNextStartTurn = true;
@@ -2405,7 +2559,7 @@ class PoolManager {
 		}
 
 		ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-		ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
+		ctx.ui.setStatus("codex-primary", formatFailoverStatus(null, pool.name));
 		return false;
 	}
 
@@ -3391,6 +3545,7 @@ async function promptForPoolDefinition(
 
 	// Ask for selection strategy
 	const strategyItems = [
+		"priority -- Always use the first healthy member and fail back to it",
 		"round-robin -- Rotate members sequentially (default)",
 		"quota-first -- Prefer the member with the most remaining quota",
 		"scheduled -- Use per-member time windows and priority roles",
@@ -3398,7 +3553,8 @@ async function promptForPoolDefinition(
 	];
 	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
 	let strategy: PoolStrategy = "round-robin";
-	if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
+	if (strategyPick?.startsWith("priority")) strategy = "priority";
+	else if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
 	else if (strategyPick?.startsWith("scheduled")) strategy = "scheduled";
 	else if (strategyPick?.startsWith("custom")) strategy = "custom";
 
@@ -3617,6 +3773,11 @@ async function changePoolStrategy(
 	const current = pool.strategy || "round-robin";
 	const items: SelectItem[] = [
 		{
+			value: "priority",
+			label: "priority",
+			description: "Always use the first healthy member and fail back to it",
+		},
+		{
 			value: "round-robin",
 			label: "round-robin",
 			description: "Rotate members sequentially (default)",
@@ -3708,7 +3869,7 @@ async function changePoolStrategy(
 		pool.selectorScript = scriptPath.trim();
 		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
 		delete pool.memberSchedule;
-	} else if (nextStrategy === "quota-first") {
+	} else if (nextStrategy === "quota-first" || nextStrategy === "priority") {
 		delete pool.memberSchedule;
 		delete pool.selectorScript;
 	}
@@ -3975,13 +4136,14 @@ function formatPoolStatusLines(
 		return lines;
 	}
 	const memberSchedule = pool.memberSchedule || {};
-	for (const member of pool.members) {
+	for (const [index, member] of pool.members.entries()) {
 		const authed = authStorage.hasAuth(member);
 		const exhausted = pool.enabled && authed && poolManager.isMemberExhausted(pool, member);
 		let status = authed ? "logged in" : "not logged in";
 		if (exhausted) status += " (rate limited, cooling down)";
 		if (pool.enabled && authed && !exhausted) status += " (available)";
 		if (!pool.enabled && authed) status += " (pool disabled)";
+		if (strategy === "priority") status += index === 0 ? " [primary]" : ` [fallback ${index}]`;
 
 		const schedule = memberSchedule[member];
 		if (schedule) {
@@ -4744,7 +4906,7 @@ async function handlePoolMenu(
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
-		"project  -- Project-level pool config (.pi/multi-pass.json)",
+		"project  -- Project-level pool config (.pi/codex-primary.json)",
 	];
 
 	const selected = await ctx.ui.select("Pool Manager", actions);
@@ -5004,7 +5166,7 @@ async function handlePresetActivate(
 
 		const prettyEntry = formatPresetEntryWith(entry, allSubs);
 		ctx.ui.notify(`Preset "${preset.name}": switched to ${prettyEntry}`, "info");
-		ctx.ui.setStatus("multi-pass", `preset:${preset.name} | ${prettyEntry}`);
+		ctx.ui.setStatus("codex-primary", `preset:${preset.name} | ${prettyEntry}`);
 		return;
 	}
 
@@ -5155,7 +5317,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				if (!success) continue;
 				const displayName = getProviderDisplayName(providerName, effective.subscriptions);
 				ctx.ui.notify(
-					`multi-pass: project restricted to ${allowedSummary}; switched to ${displayName} (${model.id}).`,
+					`codex-primary: project restricted to ${allowedSummary}; switched to ${displayName} (${model.id}).`,
 					"info",
 				);
 				return true;
@@ -5166,7 +5328,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 		const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "the current model";
 		ctx.ui.notify(
-			`multi-pass: project restricted to ${allowedSummary}, but no authenticated allowed provider can serve ${currentModel}.`,
+			`codex-primary: project restricted to ${allowedSummary}, but no authenticated allowed provider can serve ${currentModel}.`,
 			"warning",
 		);
 		return false;
@@ -5177,6 +5339,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 		poolManager.loadPersistedState();
+		await syncPriorityExhaustion(pi, ctx, poolManager, effective.pools);
 
 		const statusParts: string[] = [];
 		const enabledChains = effective.chains.filter((chain) => chain.enabled);
@@ -5190,21 +5353,18 @@ export default function multiSub(pi: ExtensionAPI) {
 		const allowedSummary = formatAllowedProviderSummary(effective);
 		if (allowedSummary) {
 			statusParts.push(`allowed ${allowedSummary}`);
-		} else {
-			const poolCount = effective.pools.filter((p) => p.enabled).length;
-			if (poolCount > 0 && !activeChain) {
-				statusParts.push(`${poolCount} pool(s)`);
-			}
 		}
 		if (statusParts.length > 0) {
-			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
+			ctx.ui.setStatus("codex-primary", statusParts.join(" | "));
 		}
 
 		await enforceProjectRestriction(ctx, "session");
+		await updateQuotaFooter(ctx, ctx.model?.provider);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		await enforceProjectRestriction(ctx, "model");
+		await updateQuotaFooter(ctx, ctx.model?.provider);
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -5216,7 +5376,16 @@ export default function multiSub(pi: ExtensionAPI) {
 
 		if (event.source !== "extension" && ctx.model) {
 			const pool = poolManager.getPoolForProvider(ctx.model.provider);
-			if (pool?.enabled && (pool.strategy || "round-robin") === "round-robin") {
+			const strategy = pool?.strategy || "round-robin";
+			if (pool?.enabled && strategy === "priority") {
+				const preferred = poolManager.getPreferredMember(pool, getAuthStorage(ctx));
+				if (preferred && preferred !== ctx.model.provider) {
+					const nextModel = ctx.modelRegistry.find(preferred, ctx.model.id);
+					if (nextModel && await safeSetModel(pi, nextModel as Model<Api>)) {
+						ctx.ui.notify(`Primary account available; switched to ${getProviderShortLabel(preferred, loadGlobalConfig())}.`, "info");
+					}
+				}
+			} else if (pool?.enabled && strategy === "round-robin") {
 				const selection = poolManager.getNextMember(
 					pool,
 					ctx.model.provider,
@@ -5226,7 +5395,7 @@ export default function multiSub(pi: ExtensionAPI) {
 					const nextModel = ctx.modelRegistry.find(selection.provider, ctx.model.id);
 					if (!nextModel) {
 						ctx.ui.notify(
-							`multi-pass: ${selection.provider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
+							`codex-primary: ${selection.provider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
 							"warning",
 						);
 					} else {
@@ -5237,16 +5406,16 @@ export default function multiSub(pi: ExtensionAPI) {
 								// pointer after the switch is confirmed; a failed
 								// switch leaves the previous index intact.
 								poolManager.commitRoundRobin(pool.name, selection.index);
-								ctx.ui.setStatus("multi-pass", `round-robin: ${selection.provider}`);
+								ctx.ui.setStatus("codex-primary", `round-robin: ${selection.provider}`);
 							} else {
 								ctx.ui.notify(
-									`multi-pass: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
+									`codex-primary: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
 									"warning",
 								);
 							}
 						} catch {
 							ctx.ui.notify(
-								`multi-pass: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
+								`codex-primary: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
 								"warning",
 							);
 						}
@@ -5422,7 +5591,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
 	pi.registerCommand("mp-preset", {
-		description: "Manage multi-pass model presets (named routing shortcuts across Codex accounts)",
+		description: "Manage Codex model presets (named routing shortcuts across accounts)",
 		getArgumentCompletions: (prefix: string) => {
 			const subcommands = ["activate", "create", "list", "toggle", "remove"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));

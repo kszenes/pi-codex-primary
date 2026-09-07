@@ -93,7 +93,7 @@ async function promptLegacyOAuth(
 	);
 }
 
-export function createOAuthInteraction(callbacks: OAuthLoginCallbacks): AuthInteraction & { signal: AbortSignal } {
+export function createOAuthInteraction(callbacks: OAuthLoginCallbacks): AuthInteraction {
 	const signal = callbacks.signal ?? new AbortController().signal;
 	return {
 		signal,

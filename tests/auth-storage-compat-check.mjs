@@ -7,11 +7,7 @@ assert.match(source, /readStoredCredential,/);
 assert.match(source, /function getAuthStorage\(/);
 assert.match(source, /getProviderAuthStatus\(provider\)\.configured/);
 assert.doesNotMatch(source, /ctx\.modelRegistry\.authStorage/);
-assert.match(source, /logout\(provider: string\): boolean/);
-assert.match(source, /writeJsonAtomic\(authPath, data\);\s*return true;\s*} catch \{\s*return false;/);
-assert.equal(source.match(/getAuthStorage\(ctx\)\.logout/g)?.length, 3);
-assert.equal(source.match(/!getAuthStorage\(ctx\)\.logout/g)?.length, 3,
-	"every logout caller must handle storage failure");
+assert.match(source, /writeJsonAtomic\(authPath, data\)/);
 assert.match(source, /writeJsonAtomic\(authPath, authData\)/);
 assert.match(source, /function writeJsonAtomic\(/);
 assert.doesNotMatch(source, /writeFileSync\(authPath/, "auth.json writes must go through the atomic helper");

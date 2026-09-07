@@ -1,8 +1,7 @@
 {
-  "name": "pi-codex-primary",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Pi extension for primary/fallback routing across multiple ChatGPT Codex OAuth subscriptions",
+  "name": "pi-codex-multi",
+  "version": "2.0.1",
+  "description": "Pi extension for multiple ChatGPT Plus/Pro Codex OAuth subscriptions with failover pools",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -24,10 +23,7 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
-  "author": "Kalman Szenes",
-  "contributors": [
-    "Helmut Januschka"
-  ],
+  "author": "hjanuschka",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kszenes/pi-codex-primary.git"

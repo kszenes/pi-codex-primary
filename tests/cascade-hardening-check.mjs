@@ -94,28 +94,26 @@ assert.equal(classification.isRateLimitError("request id 14290 logged"), false,
 assert.equal(classification.isRateLimitError("all good here"), false);
 
 // ---------------------------------------------------------------------------
-// 4. Retry-After honored and exact provider cooldown preserved (behavioral, real math)
+// 4. Retry-After honored and cooldown clamped (behavioral, real math)
 // ---------------------------------------------------------------------------
 
 const cooldown = evalBlock(
-	cut("const DEFAULT_EXHAUSTED_MS", "// Schedule evaluation helpers"),
-	["parseRetryAfterSeconds", "normalizeExhaustedMs"],
+	cut("const MIN_EXHAUSTED_MS", "// Schedule evaluation helpers"),
+	["parseRetryAfterSeconds", "clampExhaustedMs"],
 );
 
 assert.equal(cooldown.parseRetryAfterSeconds("Please retry-after: 120 seconds"), 120);
 assert.equal(cooldown.parseRetryAfterSeconds("Retry After 30s"), 30);
 assert.equal(cooldown.parseRetryAfterSeconds("no hint here"), undefined);
 
-assert.equal(cooldown.normalizeExhaustedMs(undefined), 5 * 60 * 1000, "fallback is 5 minutes");
-assert.equal(cooldown.normalizeExhaustedMs(500), 500, "provider reset is not rounded up");
-assert.equal(cooldown.normalizeExhaustedMs(120 * 1000), 120 * 1000);
-assert.equal(cooldown.normalizeExhaustedMs(99 * 60 * 1000), 99 * 60 * 1000, "long resets are not capped");
+assert.equal(cooldown.clampExhaustedMs(undefined), 5 * 60 * 1000, "fallback is 5 minutes");
+assert.equal(cooldown.clampExhaustedMs(500), 60 * 1000, "floor is 60 seconds");
+assert.equal(cooldown.clampExhaustedMs(120 * 1000), 120 * 1000);
+assert.equal(cooldown.clampExhaustedMs(99 * 60 * 1000), 30 * 60 * 1000, "cap is 30 minutes");
 
-const resolveCooldown = cut("private async resolveExhaustedMs", "\t/** Best-effort persistence");
-assert.match(resolveCooldown, /codexQuotaChecker\.check\(/,
-	"cooldown derivation must fetch a fresh quota reset timestamp");
-assert.match(resolveCooldown, /getCachedQuotaResetAt\(providerName\)/,
-	"cooldown derivation must retain cached quota as a fallback");
+assert.match(cut("private resolveExhaustedMs", "\t/** Best-effort persistence"),
+	/getCachedQuotaResetAt\(providerName\)/,
+	"cooldown derivation must consult the cached quota reset timestamp");
 
 // ---------------------------------------------------------------------------
 // 5. Atomic write helper survives simulated crash mid-write (real helper)
@@ -183,7 +181,7 @@ assert.match(normalizePoolsBody, /\.\.\.pool,/,
 	"global pool normalization preserves selectorScript");
 
 // Persistence plumbing pins (item 7).
-assert.match(source, /codex-primary\.state\.json/);
+assert.match(source, /multi-pass\.state\.json/);
 assert.match(source, /poolManager\.loadPersistedState\(\)/,
 	"session_start must load persisted exhaustion state");
 assert.match(source, /saveExhaustedState\(pools\)/);

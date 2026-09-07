@@ -271,12 +271,12 @@ function formatResetShort(resetAt?: number): string {
 	if (!resetAt) return "--";
 	const diffMs = resetAt * 1000 - Date.now();
 	if (diffMs <= 0) return "now";
-	const totalMinutes = Math.round(diffMs / 60000);
+	const totalMinutes = Math.max(1, Math.ceil(diffMs / 60000));
 	const days = Math.floor(totalMinutes / (60 * 24));
 	const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
 	const minutes = totalMinutes % 60;
-	if (days > 0) return `~${days}d`;
-	if (hours > 0) return `~${hours}h`;
+	if (days > 0) return `~${days}d${hours > 0 ? `${hours}h` : ""}`;
+	if (hours > 0) return `~${hours}h${minutes > 0 ? `${minutes}m` : ""}`;
 	return `~${minutes}m`;
 }
 
@@ -1343,8 +1343,10 @@ async function updateQuotaFooter(ctx: ExtensionContext, providerName?: string): 
 	const config = loadGlobalConfig();
 	const auth = getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined;
 	const label = getProviderShortLabel(providerName, config);
+	const firstProvider = getSwitchableProviderOptions(ctx)[0]?.providerName;
+	const fallbackPrefix = firstProvider && firstProvider !== providerName ? "↩ " : "";
 	if (!auth) {
-		ctx.ui.setStatus("codex-sub", `${label} | not logged in`);
+		ctx.ui.setStatus("codex-sub", `${fallbackPrefix}${label} | not logged in`);
 		return;
 	}
 
@@ -1355,14 +1357,14 @@ async function updateQuotaFooter(ctx: ExtensionContext, providerName?: string): 
 		auth,
 	}]);
 	if (!result || result.kind === "error" || result.kind === "missing-auth") {
-		ctx.ui.setStatus("codex-sub", `${label} | usage unavailable`);
+		ctx.ui.setStatus("codex-sub", `${fallbackPrefix}${label} | usage unavailable`);
 		return;
 	}
 	const windows = [
 		formatQuotaFooterWindow(ctx, "5h", result.fiveHourLeft, result.fiveHourResetAt),
 		formatQuotaFooterWindow(ctx, "7d", result.weeklyLeft, result.weeklyResetAt),
 	].filter((window): window is string => Boolean(window));
-	ctx.ui.setStatus("codex-sub", [label, ...windows].join(" | "));
+	ctx.ui.setStatus("codex-sub", [`${fallbackPrefix}${label}`, ...windows].join(" | "));
 }
 
 function getProjectScopedProviderNames(
@@ -5256,15 +5258,8 @@ export default function multiSub(pi: ExtensionAPI) {
 		const allowedSummary = formatAllowedProviderSummary(effective);
 		if (allowedSummary) {
 			statusParts.push(`allowed ${allowedSummary}`);
-		} else {
-			const poolCount = effective.pools.filter((p) => p.enabled).length;
-			if (poolCount > 0 && !activeChain) {
-				statusParts.push(`${poolCount} pool(s)`);
-			}
 		}
-		if (statusParts.length > 0) {
-			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
-		}
+		ctx.ui.setStatus("multi-pass", statusParts.length > 0 ? statusParts.join(" | ") : undefined);
 
 		await enforceProjectRestriction(ctx, "session");
 		await updateQuotaFooter(ctx, ctx.model?.provider);

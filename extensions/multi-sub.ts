@@ -5379,7 +5379,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.registerShortcut("ctrl+shift+s", {
+	pi.registerShortcut("ctrl+shift+a", {
 		description: "Switch Codex subscription",
 		handler: async (ctx) => {
 			if (!ctx.isIdle()) {

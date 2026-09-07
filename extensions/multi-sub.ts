@@ -5375,13 +5375,20 @@ export default function multiSub(pi: ExtensionAPI) {
 	});
 
 	pi.registerShortcut("ctrl+shift+a", {
-		description: "Switch Codex subscription",
+		description: "Cycle Codex subscription",
 		handler: async (ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Wait for the current response before switching accounts.", "info");
 				return;
 			}
-			await handleSubsSwitch(pi, ctx);
+			const options = getSwitchableProviderOptions(ctx);
+			if (options.length === 0) {
+				await handleSubsSwitch(pi, ctx);
+				return;
+			}
+			const currentIndex = options.findIndex((option) => option.providerName === ctx.model?.provider);
+			const next = options[(currentIndex + 1) % options.length];
+			await handleSubsSwitch(pi, ctx, next.providerName);
 		},
 	});
 

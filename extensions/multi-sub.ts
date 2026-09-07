@@ -497,7 +497,7 @@ function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): 
 }
 
 async function showWrappedSelect(
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	options: {
 		title: string;
 		items: SelectItem[];
@@ -2583,7 +2583,7 @@ function resolveSwitchTargetModel(
 
 async function handleSubsSwitch(
 	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	requestedProviderName?: string,
 ): Promise<void> {
 	const options = getSwitchableProviderOptions(ctx);
@@ -5377,6 +5377,17 @@ export default function multiSub(pi: ExtensionAPI) {
 				}
 			}
 		}
+	});
+
+	pi.registerShortcut("ctrl+shift+s", {
+		description: "Switch Codex subscription",
+		handler: async (ctx) => {
+			if (!ctx.isIdle()) {
+				ctx.ui.notify("Wait for the current response before switching accounts.", "info");
+				return;
+			}
+			await handleSubsSwitch(pi, ctx);
+		},
 	});
 
 	// Register /subs command

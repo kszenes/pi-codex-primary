@@ -14,6 +14,7 @@ pi install git:github.com/kszenes/pi-codex-primary
 
 - Multiple `openai-codex` OAuth subscriptions (`openai-codex-2`, `openai-codex-3`, ...)
 - `/subs` account management and Codex quota snapshots
+- `Ctrl+Shift+S` opens the account switcher
 - Active-account footer with five-hour and seven-day quota/reset information
 - Rotation pools with `round-robin`, `quota-first`, `scheduled`, and `custom` strategies
 - `round-robin` switches to the next eligible account before each external user turn; extension-injected failover retries do not consume another slot.

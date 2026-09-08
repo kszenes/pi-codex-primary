@@ -1,4 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = readFileSync(new URL("../extensions/multi-sub.ts", import.meta.url), "utf8");
+
+assert.match(source, /safeSetModel\(pi, nextModel\)[\s\S]*?updateQuotaFooter\(ctx, nextModel\.provider\)/);
+assert.match(source, /let accountSwitchInFlight = false;[\s\S]*?if \(accountSwitchInFlight\) return;[\s\S]*?finally \{[\s\S]*?accountSwitchInFlight = false;/);
 
 function subProviderName(entry) {
   return `${entry.provider}-${entry.index}`;

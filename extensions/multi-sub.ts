@@ -2636,6 +2636,9 @@ async function handleSubsSwitch(
 		ctx.ui.notify(`Failed to switch to ${selected.label}.`, "error");
 		return;
 	}
+	// Redraw after setModel() settles so Pi's built-in model footer sees the
+	// confirmed provider rather than its pre-shortcut snapshot.
+	await updateQuotaFooter(ctx, nextModel.provider);
 	ctx.ui.notify(`Switched to ${selected.label} (${nextModel.id}).`, "info");
 }
 
@@ -5270,6 +5273,10 @@ export default function multiSub(pi: ExtensionAPI) {
 		await updateQuotaFooter(ctx, ctx.model?.provider);
 	});
 
+	pi.on("agent_settled", async (_event, ctx) => {
+		await updateQuotaFooter(ctx, ctx.model?.provider);
+	});
+
 	pi.on("input", async (event, ctx) => {
 		if (event.text.trimStart().startsWith("/")) {
 			return { action: "continue" as const };
@@ -5374,21 +5381,28 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
+	let accountSwitchInFlight = false;
 	pi.registerShortcut("ctrl+shift+a", {
 		description: "Cycle Codex subscription",
 		handler: async (ctx) => {
-			if (!ctx.isIdle()) {
-				ctx.ui.notify("Wait for the current response before switching accounts.", "info");
-				return;
+			if (accountSwitchInFlight) return;
+			accountSwitchInFlight = true;
+			try {
+				if (!ctx.isIdle()) {
+					ctx.ui.notify("Wait for the current response before switching accounts.", "info");
+					return;
+				}
+				const options = getSwitchableProviderOptions(ctx);
+				if (options.length === 0) {
+					await handleSubsSwitch(pi, ctx);
+					return;
+				}
+				const currentIndex = options.findIndex((option) => option.providerName === ctx.model?.provider);
+				const next = options[(currentIndex + 1) % options.length];
+				await handleSubsSwitch(pi, ctx, next.providerName);
+			} finally {
+				accountSwitchInFlight = false;
 			}
-			const options = getSwitchableProviderOptions(ctx);
-			if (options.length === 0) {
-				await handleSubsSwitch(pi, ctx);
-				return;
-			}
-			const currentIndex = options.findIndex((option) => option.providerName === ctx.model?.provider);
-			const next = options[(currentIndex + 1) % options.length];
-			await handleSubsSwitch(pi, ctx, next.providerName);
 		},
 	});
 

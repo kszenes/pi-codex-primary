@@ -5,6 +5,7 @@ const source = readFileSync(new URL("../extensions/multi-sub.ts", import.meta.ur
 
 assert.match(source, /pi\.on\("session_start"[\s\S]*?updateQuotaFooter/);
 assert.match(source, /pi\.on\("model_select"[\s\S]*?updateQuotaFooter/);
+assert.match(source, /pi\.on\("agent_settled"[\s\S]*?updateQuotaFooter/);
 assert.match(source, /registerShortcut\("ctrl\+shift\+a"[\s\S]*?findIndex[\s\S]*?\(currentIndex \+ 1\) % options\.length[\s\S]*?handleSubsSwitch\(pi, ctx, next\.providerName\)/);
 assert.match(source, /formatQuotaFooterWindow\(ctx, "5h", result\.fiveHourLeft, result\.fiveHourResetAt\)/);
 assert.match(source, /formatQuotaFooterWindow\(ctx, "7d", result\.weeklyLeft, result\.weeklyResetAt\)/);
